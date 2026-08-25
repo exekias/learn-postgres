@@ -11,6 +11,11 @@
  * Idempotent: a template is created only if its exact-hash name is missing, so
  * unchanged seeds are skipped and changed seeds get a brand-new template.
  *
+ * Also keeps the parent and existing templates on the latest available
+ * Postgres minor of the parent's current major (minor upgrades are in-place
+ * and data-compatible). Usually a noop; failures there only warn, since the
+ * next deploy retries.
+ *
  * Fatal: exits non-zero on any failure so a deploy never ships a lesson whose
  * template couldn't be built.
  *
@@ -30,8 +35,11 @@ import { templateBranchName } from "../lib/templates";
 import {
   awaitConnectionString,
   createBranch,
+  getBranch,
+  listAvailableImages,
   listBranches,
   resolveBranchDsn,
+  updateBranchImage,
   type XataBranch,
 } from "../lib/xata-rest";
 
@@ -71,6 +79,89 @@ function resolveMainParent(branches: XataBranch[]): string {
     );
   }
   return match.id;
+}
+
+type ParsedImage = { offering: string; major: number; minor: number };
+
+function parseImage(image: string): ParsedImage | null {
+  const m = /^([^:]+):(\d+)\.(\d+)$/.exec(image);
+  return m
+    ? { offering: m[1], major: Number(m[2]), minor: Number(m[3]) }
+    : null;
+}
+
+/**
+ * Upgrade the parent and every existing tpl-* branch to the latest available
+ * minor of the parent's current major/offering. The parent goes first so
+ * templates created later in this run inherit the new image. Only warns on
+ * failure — an upgrade that doesn't land just retries on the next deploy.
+ */
+async function upgradeBranchImages(
+  parentId: string,
+  branches: XataBranch[],
+): Promise<void> {
+  let parent: XataBranch;
+  let latest: (ParsedImage & { name: string }) | undefined;
+  try {
+    parent = await getBranch(parentId);
+    const parentImage = parent.configuration?.image;
+    const current = parentImage ? parseImage(parentImage) : null;
+    if (!current) {
+      console.warn(
+        `  ! parent image "${parentImage}" is missing or unparsable — skipping Postgres upgrades`,
+      );
+      return;
+    }
+    for (const img of await listAvailableImages()) {
+      const p = parseImage(img.name);
+      if (!p || p.offering !== current.offering || p.major !== current.major)
+        continue;
+      if (!latest || p.minor > latest.minor) latest = { ...p, name: img.name };
+    }
+    if (!latest || latest.minor <= current.minor) {
+      console.log(`Postgres image ${parentImage} is the latest available.`);
+      // The parent is current, but templates created before an earlier upgrade
+      // may still lag — fall through and check them too.
+      latest = { ...current, name: parentImage! };
+    }
+  } catch (err) {
+    console.warn(
+      `  ! could not resolve Postgres images (${(err as Error).message}) — skipping upgrades`,
+    );
+    return;
+  }
+
+  const templates = branches.filter(
+    (b) => b.name.startsWith("tpl-") && b.id !== parent.id,
+  );
+  let upgraded = 0;
+  for (const b of [parent, ...templates]) {
+    try {
+      const detail = b.id === parent.id ? parent : await getBranch(b.id);
+      const image = detail.configuration?.image;
+      if (!image || image === latest.name) continue;
+      const cur = parseImage(image);
+      if (
+        !cur ||
+        cur.offering !== latest.offering ||
+        cur.major !== latest.major ||
+        cur.minor >= latest.minor
+      ) {
+        console.warn(`  ! ${detail.name}: ${image} not upgradable to ${latest.name} — skipping`);
+        continue;
+      }
+      console.log(`  ^ ${detail.name}: ${image} → ${latest.name}`);
+      await updateBranchImage(detail.id, latest.name);
+      upgraded++;
+    } catch (err) {
+      console.warn(
+        `  ! ${b.name}: image upgrade failed (${(err as Error).message})`,
+      );
+    }
+  }
+  if (upgraded > 0) {
+    console.log(`Upgraded ${upgraded} branch(es) to ${latest.name}.\n`);
+  }
 }
 
 /**
@@ -119,6 +210,7 @@ async function main() {
 
   const branches = await listBranches();
   const parentId = resolveMainParent(branches);
+  await upgradeBranchImages(parentId, branches);
   const existing = new Set(branches.map((b) => b.name));
 
   let created = 0;

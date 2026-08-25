@@ -19,6 +19,15 @@ export type XataBranch = {
   updatedAt: string;
   publicAccess?: boolean;
   connectionString?: string | null;
+  /** Only returned by the branch-details endpoint, not the list endpoint. */
+  configuration?: { image?: string };
+};
+
+export type XataImage = {
+  /** `<offering>:<version>`, e.g. "postgres:18.6". */
+  name: string;
+  majorVersion: string;
+  fullVersion: string;
 };
 
 export type XataCredentials = { username: string; password: string };
@@ -128,6 +137,33 @@ export async function createBranch(input: {
       parentID: input.parentId,
     }),
   });
+}
+
+/** Postgres images available to the organization (org-scoped, not project). */
+export async function listAvailableImages(): Promise<XataImage[]> {
+  const cfg = loadConfig();
+  const res = await call<{ images: XataImage[] }>(
+    cfg,
+    `/organizations/${encodeURIComponent(cfg.orgId)}/images`,
+  );
+  return res.images;
+}
+
+/**
+ * In-place Postgres image change. Xata only accepts minor-version upgrades
+ * within the branch's current major and offering, and the image must be the
+ * only field in the PATCH (it can't be combined with other config changes).
+ */
+export async function updateBranchImage(
+  branchId: string,
+  image: string,
+): Promise<void> {
+  const cfg = loadConfig();
+  await call<unknown>(
+    cfg,
+    `${base(cfg)}/branches/${encodeURIComponent(branchId)}`,
+    { method: "PATCH", body: JSON.stringify({ image }) },
+  );
 }
 
 export async function deleteBranch(branchId: string): Promise<void> {
