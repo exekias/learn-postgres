@@ -20,7 +20,7 @@
     "@neondatabase/serverless": "^1.1.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
-    "better-auth": "^1.7.1",
+    "better-auth": "^1.7.2",
     "drizzle-orm": "^0.45.2",
     "js-yaml": "^5.4.0",
     "next": "16.3.3",
